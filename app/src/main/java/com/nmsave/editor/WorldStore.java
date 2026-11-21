@@ -100,7 +100,26 @@ public class WorldStore {
                 }
             }
         }
+        // 修改时间越近越靠前；时间缺失的排最后
+        java.util.Collections.sort(r.worlds, new java.util.Comparator<World>() {
+            public int compare(World a, World b) {
+                return Long.compare(b.modified, a.modified);
+            }
+        });
         return r;
+    }
+
+    /** 相对“现在”的时间描述：刚刚 / N 分钟前 / N 小时前 / N 天前 / 具体日期。 */
+    public static String relTime(long ms) {
+        if (ms <= 0) return "时间未知";
+        long now = System.currentTimeMillis();
+        long d = now - ms;
+        if (d < 0) d = 0;
+        if (d < 60L * 1000) return "刚刚";
+        if (d < 3600L * 1000) return (d / (60L * 1000)) + " 分钟前";
+        if (d < 24L * 3600 * 1000) return (d / (3600L * 1000)) + " 小时前";
+        if (d < 7L * 24 * 3600 * 1000) return (d / (24L * 3600 * 1000)) + " 天前";
+        return timeText(ms);
     }
 
     private static void findByName(File dir, String target, int depth, int maxDepth,
@@ -282,6 +301,7 @@ public class WorldStore {
         File inner = new File(dst, w.id);
         inner.mkdirs();
         Editor.copyDir(w.dir, inner, null);
+        AppLog.i("备份", "整目录备份 " + w.name + " → " + dst.getAbsolutePath());
         writeNote(dst, w, "整目录备份（原样，未做任何修改）",
                 "还原：把本目录下的 " + w.id + " 整个文件夹复制回 "
                         + (w.rootPath.isEmpty() ? "minecraftWorlds 目录" : w.rootPath) + " 即可。");
@@ -326,6 +346,7 @@ public class WorldStore {
         } finally {
             fo.close();
         }
+        AppLog.i("备份", "写回前备份 " + w.name + " → " + dst.getAbsolutePath());
         return dst;
     }
 
@@ -369,6 +390,7 @@ public class WorldStore {
         }
         Editor.deleteRecursivePublic(stashDb);
         Editor.deleteRecursivePublic(stashLevel);
+        AppLog.i("写入", "db/level.dat 已替换 " + w.dir.getAbsolutePath());
         return backupDir;
     }
 }

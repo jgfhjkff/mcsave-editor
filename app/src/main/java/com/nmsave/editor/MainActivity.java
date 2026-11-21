@@ -32,6 +32,8 @@ import android.text.InputType;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
+import android.view.MotionEvent;
+import android.view.ViewParent;
 import android.view.ViewGroup;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
@@ -41,7 +43,6 @@ import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
-import android.widget.Spinner;
 import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.CompoundButton;
@@ -63,6 +64,8 @@ public class MainActivity extends Activity {
     private static final int REQ_SAVE = 2002;
     private static final int REQ_SAVE_RAW = 2003;
     private static final String CRASH_FILE = "last_crash.txt";
+    public static final String EXTRA_WDIR = "nm_quick_wdir";
+    public static final String EXTRA_SLOT = "nm_quick_slot";
 
     private final Handler ui = new Handler(Looper.getMainLooper());
 
@@ -76,16 +79,18 @@ public class MainActivity extends Activity {
     private CheckBox cbPurge, cbKindAll, cbBoat, cbMob, cbItemKind, cbXp, cbOther,
             cbDigests, cbPlayer, cbRepack, cbPos, cbHeld, cbBlock;
     private EditText etBlockX, etBlockY, etBlockZ, etBlockName, etBlockStates;
-    private Spinner spBlockDim;
-    private Spinner spMode, spDifficulty, spCheats, spPvp, spKeepInv, spDaylight;
-    private Spinner spTime, spWeather;
+    private Picker spBlockDim;
+    private Picker spMode, spDifficulty, spCheats, spPvp, spKeepInv, spDaylight;
+    private Picker spTime, spWeather;
     private EditText etTimeCustom, etWeatherMin, etSeed;
     private CheckBox cbSpawn;
     private EditText etSpawnX, etSpawnY, etSpawnZ;
-    private final java.util.Map<String, Spinner> ruleSpins = new java.util.LinkedHashMap<>();
+    private final java.util.Map<String, Picker> ruleSpins = new java.util.LinkedHashMap<>();
     private EditText etEntityIds, etPosX, etPosY, etPosZ, etItem, etItemCount, etItemAux;
     private Button btnApply, btnExportZip;
     private FrameLayout frame;
+    private View noticeView;            // 底部提示条（几秒后自动消失）
+    private Runnable pendingHide;
     private LinearLayout drawer;
     private View overlay;
     private int drawerWidth;
@@ -93,6 +98,17 @@ public class MainActivity extends Activity {
     private boolean detailMode;
     private boolean backupMode;
     private boolean settingsMode;
+    // 备份管理：长按卡片进入多选删除
+    private boolean backupSelecting;
+    private final java.util.LinkedHashSet<String> backupSel = new java.util.LinkedHashSet<>();
+    private final java.util.Map<String, TextView> backupMarks = new java.util.HashMap<>();
+    private LinearLayout backupBar;
+    private TextView backupBarCount;
+    private Runnable backupSelUi;
+    // 备份列表区（刷新时只重填这一块，不重建整页）
+    private LinearLayout backupListCol;
+    private TextView backupSummaryView;
+    private java.util.List<WorldStore.BackupEntry> backupItems = new java.util.ArrayList<>();
     private java.util.List<WorldStore.World> lastWorlds = new java.util.ArrayList<>();
     // 列表缓存：来回切页面不再重新扫描/重绘，只有数据变了才重扫
     private WorldStore.ScanResult cachedScan;
@@ -120,11 +136,55 @@ public class MainActivity extends Activity {
         applyPalette(prefBool(KEY_DARK, systemIsDark()));
         applySystemBars();
         installCrashLogger();
+        AppLog.i("应用", "启动");
         try {
             showListScreen();
         } catch (Throwable t) {
             showFatal(t);
         }
+        handleQuickIntent(getIntent());
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleQuickIntent(intent);
+    }
+
+    /** 小窗兜底入口：直接打开某个世界的某一格 NBT 编辑页。 */
+    private void handleQuickIntent(Intent it) {
+        if (it == null) return;
+        String dir = it.getStringExtra(EXTRA_WDIR);
+        if (dir == null || dir.length() == 0) return;
+        final int slot = it.getIntExtra(EXTRA_SLOT, 0);
+        File wf = new File(dir);
+        if (!wf.isDirectory()) {
+            Toast.makeText(this, "存档目录不存在：" + dir, Toast.LENGTH_LONG).show();
+            return;
+        }
+        current = WorldStore.probe(wf);
+        new Thread(new Runnable() {
+            public void run() {
+                try {
+                    Nbt.Tag tag = Editor.readPlayerSectionTag(current.dir, "Inventory");
+                    if (tag != null && tag.type == Nbt.TAG_LIST) {
+                        Nbt.ListTag lt = (Nbt.ListTag) tag.value;
+                        invSlots.clear();
+                        for (Nbt.Tag item : lt.items) {
+                            if (item.type != Nbt.TAG_COMPOUND) continue;
+                            Nbt.Tag sl = ((Nbt.Compound) item.value).get("Slot");
+                            if (sl == null || !(sl.value instanceof Number)) continue;
+                            invSlots.put(((Number) sl.value).intValue(), item);
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+                ui.post(new Runnable() {
+                    public void run() { showSlotEditor(slot); }
+                });
+            }
+        }).start();
     }
 
     // ================================================================ 列表界面
@@ -149,7 +209,7 @@ public class MainActivity extends Activity {
         tvHint = text("", 12, false, C_HINT);
         root.addView(tvHint);
         tvHint.setText("写入前会自动备份原存档到 " + WorldStore.backupRoot().getAbsolutePath()
-                + "。请先在游戏里退出该世界并结束游戏进程，再回来写入。");
+                + "。请先在游戏里退出该世界（不必关整个游戏）；若游戏仍在后台挂着这个世界，写入可能被它覆盖，稳妥起见可顺手结束进程再写入。");
 
         detailMode = false;
         backupMode = false;
@@ -233,6 +293,9 @@ public class MainActivity extends Activity {
                         scanning = false;
                         cachedScan = r;
                         scanNeeded = false;
+                        AppLog.i("扫描", "找到 " + r.worlds.size() + " 个存档"
+                                + (r.permissionDenied ? "（权限不足）" : "")
+                                + (r.errors.isEmpty() ? "" : "，错误 " + r.errors.size() + " 条"));
                         renderWorlds(r);
                     }
                 });
@@ -259,8 +322,7 @@ public class MainActivity extends Activity {
             final WorldStore.World w = r.worlds.get(i);
             LinearLayout card = column();
             card.setPadding(dp(14), dp(13), dp(14), dp(13));
-            card.setBackground(bg(C_CARD, 12, C_STROKE));
-            card.setClickable(true);
+            applyCardRipple(card);
 
             LinearLayout headRow = new LinearLayout(this);
             headRow.setOrientation(LinearLayout.HORIZONTAL);
@@ -270,20 +332,20 @@ public class MainActivity extends Activity {
             nameView.setEllipsize(TextUtils.TruncateAt.END);
             headRow.addView(nameView, new LinearLayout.LayoutParams(0,
                     ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-            TextView eye = new TextView(this);
-            eye.setText("\uD83D\uDDBC\uFE0F");
-            eye.setTextSize(20);
-            eye.setGravity(Gravity.CENTER);
+            PhotoIconView eye = new PhotoIconView(this);
+            eye.setTint(C_HINT);
             eye.setContentDescription("查看世界图标 world_icon.jpeg");
-            eye.setPadding(dp(8), dp(6), dp(4), dp(6));
-            if (!new File(w.dir, "world_icon.jpeg").isFile()) eye.setAlpha(0.3f);
+            if (!new File(w.dir, "world_icon.jpeg").isFile()) eye.setAlpha(0.35f);
             eye.setOnClickListener(new View.OnClickListener() {
                 public void onClick(View v) { showWorldIcon(w); }
             });
-            headRow.addView(eye, new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+            LinearLayout.LayoutParams eyeLp = new LinearLayout.LayoutParams(dp(24), dp(24));
+            eyeLp.leftMargin = dp(10);
+            eyeLp.rightMargin = dp(2);
+            headRow.addView(eye, eyeLp);
             card.addView(headRow);
-            card.addView(text("目录 " + w.id + "    修改 " + WorldStore.timeText(w.modified), 12, false, C_SUB));
+            card.addView(text("目录 " + w.id + "    修改 " + WorldStore.relTime(w.modified)
+                    + "（" + WorldStore.timeText(w.modified) + "）", 12, false, C_SUB));
             String flags = ("intl".equals(w.edition) ? "国际版" : ("netease".equals(w.edition) ? "网易版" : "未知版本"))
                     + "    " + WorldStore.sizeText(w.sizeBytes)
                     + (w.encrypted ? "    加密库" : "    未加密库")
@@ -321,7 +383,7 @@ public class MainActivity extends Activity {
             worldList.addView(card, lp);
         }
         tvHint.setText("写入前会自动备份原存档到 " + WorldStore.backupRoot().getAbsolutePath()
-                + "。请先在游戏里退出该世界并结束游戏进程，再回来写入。");
+                + "。请先在游戏里退出该世界（不必关整个游戏）；若游戏仍在后台挂着这个世界，写入可能被它覆盖，稳妥起见可顺手结束进程再写入。");
     }
 
     /** 看存档目录里的 world_icon.jpeg，解码后居中显示（不依赖系统看图应用）。 */
@@ -400,7 +462,9 @@ public class MainActivity extends Activity {
             win.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(0x00000000));
             win.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
         }
+        popPrep(card);
         dlg.show();
+        popStart(card);
     }
 
     /** 列表卡片里的等宽小按钮。 */
@@ -429,25 +493,81 @@ public class MainActivity extends Activity {
         if (tvLog != null) tvLog.append(msg + "\n");
     }
 
+    /**
+     * 底部浮层提示：从屏幕底部淡入，autoHide 时几秒后自动淡出消失。
+     * 不用系统 Toast，是为了跟应用配色一致、且长路径也能换行完整显示。
+     */
+    private void bottomNotice(String msg, boolean autoHide) {
+        if (frame == null) { status(msg); return; }
+        cancelNotice();
+        final TextView tv = new TextView(this);
+        tv.setText(msg);
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        tv.setTextColor(0xFFFFFFFF);
+        tv.setLineSpacing(dp(3), 1f);
+        tv.setMaxLines(5);
+        tv.setEllipsize(TextUtils.TruncateAt.END);
+        tv.setPadding(dp(16), dp(12), dp(16), dp(12));
+        GradientDrawable g = new GradientDrawable();
+        g.setColor(0xF01F242B);
+        g.setCornerRadius(dp(14));
+        tv.setBackground(g);
+        tv.setElevation(dp(8));
+        tv.setClickable(false);
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.gravity = Gravity.BOTTOM;
+        lp.leftMargin = dp(16);
+        lp.rightMargin = dp(16);
+        lp.bottomMargin = dp(24);
+        frame.addView(tv, lp);
+        noticeView = tv;
+        tv.setAlpha(0f);
+        tv.setTranslationY(dp(26));
+        tv.animate().alpha(1f).translationY(0f).setDuration(200).start();
+        if (autoHide) {
+            pendingHide = new Runnable() {
+                public void run() {
+                    tv.animate().alpha(0f).translationY(dp(18)).setDuration(200)
+                            .withEndAction(new Runnable() {
+                                public void run() { cancelNotice(); }
+                            }).start();
+                }
+            };
+            ui.postDelayed(pendingHide, 3000);
+        }
+    }
+
+    /** 立即收起底部提示（换页/新提示时调用，避免残留）。 */
+    private void cancelNotice() {
+        if (pendingHide != null) { ui.removeCallbacks(pendingHide); pendingHide = null; }
+        if (noticeView != null) {
+            View v = noticeView;
+            noticeView = null;
+            if (v.getParent() == frame) frame.removeView(v);
+        }
+    }
+
     /** 原样整目录备份：不经过任何处理逻辑。 */
     private void quickBackup(final WorldStore.World w) {
         if (busy) return;
         busy = true;
-        status("正在备份「" + w.name + "」…");
+        bottomNotice("正在备份「" + w.name + "」…", false);
         new Thread(new Runnable() {
             public void run() {
                 try {
                     final File dst = WorldStore.fullBackup(w);
+                    AppLog.i("备份", "整目录备份 " + w.name + " → " + dst.getAbsolutePath());
                     ui.post(new Runnable() {
                         public void run() {
-                            status("备份完成：" + dst.getAbsolutePath());
+                            bottomNotice("备份完成：" + dst.getAbsolutePath(), true);
                             busy = false;
                         }
                     });
                 } catch (final Throwable e) {
                     ui.post(new Runnable() {
                         public void run() {
-                            status("备份失败：" + friendlyError(e));
+                            bottomNotice("备份失败：" + friendlyError(e), true);
                             busy = false;
                         }
                     });
@@ -466,13 +586,13 @@ public class MainActivity extends Activity {
         try {
             startActivityForResult(i, REQ_SAVE_RAW);
         } catch (Throwable t) {
-            status("打开保存失败：" + t);
+            bottomNotice("打开保存失败：" + t, true);
         }
     }
 
     private void doRawExport(final WorldStore.World w, final Uri target) {
         busy = true;
-        status("正在打包「" + w.name + "」…");
+        bottomNotice("正在打包「" + w.name + "」…", false);
         new Thread(new Runnable() {
             public void run() {
                 File zip = new File(getCacheDir(), "raw_" + System.currentTimeMillis() + ".zip");
@@ -487,7 +607,7 @@ public class MainActivity extends Activity {
                     zip.delete();
                     ui.post(new Runnable() {
                         public void run() {
-                            status("已导出（原样，未修改）：" + size);
+                            bottomNotice("已导出（原样，未修改）：" + size, true);
                             busy = false;
                         }
                     });
@@ -496,7 +616,7 @@ public class MainActivity extends Activity {
                     zip.delete();
                     ui.post(new Runnable() {
                         public void run() {
-                            status("导出失败：" + e);
+                            bottomNotice("导出失败：" + e, true);
                             if (tvLog != null) tvLog.append(msg + "\n");
                             busy = false;
                         }
@@ -641,9 +761,8 @@ public class MainActivity extends Activity {
         TextView dimLabel = text("维度", 12, false, C_HINT);
         dimRow.addView(dimLabel, new LinearLayout.LayoutParams(dp(44),
                 ViewGroup.LayoutParams.WRAP_CONTENT));
-        spBlockDim = new Spinner(this);
-        spBlockDim.setPopupBackgroundDrawable(bg(C_CARD, 8, C_STROKE));
-        spBlockDim.setAdapter(new TintAdapter(this, new String[]{"主世界", "下界", "末地"}));
+        spBlockDim = new Picker();
+        spBlockDim.setItems(new String[]{"主世界", "下界", "末地"});
         dimRow.addView(spBlockDim, new LinearLayout.LayoutParams(0,
                 ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
@@ -731,8 +850,8 @@ public class MainActivity extends Activity {
         tvExpand.setOnClickListener(new View.OnClickListener() {
             public void onClick(View v) {
                 boolean show = rulesBox.getVisibility() != View.VISIBLE;
-                rulesBox.setVisibility(show ? View.VISIBLE : View.GONE);
                 tvExpand.setText(show ? "收起游戏规则 ‹" : "展开游戏规则（10 项）›");
+                foldAnimate(rulesBox, show);
             }
         });
 
@@ -750,7 +869,7 @@ public class MainActivity extends Activity {
 
     private void updateBlockEnable() {
         boolean on = cbBlock.isChecked() && !cbRepack.isChecked();
-        spBlockDim.setEnabled(on);
+        spBlockDim.setOn(on);
         for (EditText e : new EditText[]{etBlockX, etBlockY, etBlockZ, etBlockName, etBlockStates}) e.setEnabled(on);
     }
 
@@ -769,18 +888,18 @@ public class MainActivity extends Activity {
         cbPlayer.setEnabled(on);
         cbPos.setEnabled(on);
         cbHeld.setEnabled(on);
-        spMode.setEnabled(on);
-        spDifficulty.setEnabled(on);
-        spCheats.setEnabled(on);
-        spPvp.setEnabled(on);
-        spKeepInv.setEnabled(on);
-        spDaylight.setEnabled(on);
+        spMode.setOn(on);
+        spDifficulty.setOn(on);
+        spCheats.setOn(on);
+        spPvp.setOn(on);
+        spKeepInv.setOn(on);
+        spDaylight.setOn(on);
         if (cbBlock != null) updateBlockEnable();
         updateKindEnable();
     }
 
     // ================================================================ 组装参数
-    private Boolean tri(Spinner sp) {
+    private Boolean tri(Picker sp) {
         int p = sp.getSelectedItemPosition();
         if (p == 1) return Boolean.TRUE;
         if (p == 2) return Boolean.FALSE;
@@ -927,7 +1046,7 @@ public class MainActivity extends Activity {
         }
         String seedText = etSeed.getText().toString().trim();
         if (!seedText.isEmpty()) opt.seed = Long.parseLong(seedText);
-        for (java.util.Map.Entry<String, Spinner> e : ruleSpins.entrySet()) {
+        for (java.util.Map.Entry<String, Picker> e : ruleSpins.entrySet()) {
             int p = e.getValue().getSelectedItemPosition();
             if (p > 0) opt.rules.put(e.getKey(), p == 1 ? 1 : 0);
         }
@@ -976,7 +1095,7 @@ public class MainActivity extends Activity {
     }
 
     private void setRule(String key, int pos) {
-        Spinner sp = ruleSpins.get(key);
+        Picker sp = ruleSpins.get(key);
         if (sp != null) sp.setSelection(pos);
     }
 
@@ -1070,14 +1189,9 @@ public class MainActivity extends Activity {
         if (busy || current == null) return;
         if (!validate()) return;
         final Editor.Options opt = collectOptions();
-        new AlertDialog.Builder(this)
-                .setTitle("确认写入存档")
-                .setMessage(summary(opt))
-                .setPositiveButton("备份并写入", new android.content.DialogInterface.OnClickListener() {
-                    public void onClick(android.content.DialogInterface d, int which) { runWriteBack(opt); }
-                })
-                .setNegativeButton("取消", null)
-                .show();
+        cardDialog("确认写入存档", summary(opt), "备份并写入",
+                new Runnable() { public void run() { runWriteBack(opt); } },
+                "取消", false);
     }
 
     private void runWriteBack(final Editor.Options opt) {
@@ -1097,6 +1211,8 @@ public class MainActivity extends Activity {
                         }
                     });
                     final File backup = WorldStore.writeBack(current, outDir);
+                    AppLog.i("写入", "成功 dir=" + current.dir + " 删除实体=" + st.purged
+                            + " 保留键=" + st.keptCount + " 备份=" + backup.getAbsolutePath());
                     final String log = "写入完成：删除实体 " + st.purged + " 个，保留键值 " + st.keptCount
                             + " 条"
                             + (st.blockMessage == null ? "" : "\n" + st.blockMessage)
@@ -1115,6 +1231,7 @@ public class MainActivity extends Activity {
                         }
                     });
                 } catch (final Throwable e) {
+                    AppLog.e("写入", "失败 dir=" + (current == null ? "?" : current.dir), e);
                     final String msg = crashText(e);
                     Editor.deleteRecursivePublic(work);
                     Editor.deleteRecursivePublic(outDir);
@@ -1178,6 +1295,7 @@ public class MainActivity extends Activity {
                         }
                     });
                 } catch (final Throwable e) {
+                    AppLog.e("写入", "失败 dir=" + (current == null ? "?" : current.dir), e);
                     final String msg = crashText(e);
                     Editor.deleteRecursivePublic(work);
                     Editor.deleteRecursivePublic(outDir);
@@ -1261,6 +1379,7 @@ public class MainActivity extends Activity {
     // ================================================================ 抽屉菜单
     private static final String PREF = "nm_settings";
     private static final String KEY_INTL = "include_intl";
+    private static final String KEY_FLOAT = "float_mode";
     private static final String KEY_DARK = "dark_theme";
 
     /** 状态栏跟随当前主题（深色时清掉浅色图标标记）。 */
@@ -1282,6 +1401,58 @@ public class MainActivity extends Activity {
             }
         } catch (Throwable ignored) {
         }
+    }
+
+    private TextView floatStateView;
+
+    /** 前台每秒兜底：开关开着就确保服务在跑、窗口在挂。 */
+    private final Runnable floatTick = new Runnable() {
+        public void run() {
+            boolean perm = android.provider.Settings.canDrawOverlays(MainActivity.this);
+            if (prefBool(KEY_FLOAT, false) && perm && !FloatService.running) {
+                FloatService.start(MainActivity.this);
+            }
+            updateFloatState(perm);
+            ui.postDelayed(this, 1000);
+        }
+    };
+
+    private void updateFloatState(boolean perm) {
+        if (floatStateView == null) return;
+        String s;
+        if (!prefBool(KEY_FLOAT, false)) {
+            s = "状态：未开启";
+            floatStateView.setText(s);
+            floatStateView.setTextColor(C_HINT);
+            return;
+        }
+        if (!perm) {
+            s = "状态：缺少「显示在其他应用上层」权限，小窗无法显示";
+        } else if (FloatService.windowShown) {
+            s = "状态：运行中";
+        } else if (FloatService.running) {
+            s = "状态：服务在运行，窗口没挂上，正在每秒重试"
+                    + (FloatService.lastError == null ? "" : "（" + FloatService.lastError + "）");
+        } else {
+            s = "状态：服务未运行，正在重试拉起…";
+        }
+        floatStateView.setText(s);
+        floatStateView.setTextColor(perm && FloatService.windowShown ? C_ACCENT : dangerColor());
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (prefBool(KEY_FLOAT, false)) {
+            ui.removeCallbacks(floatTick);
+            ui.post(floatTick);
+        }
+    }
+
+    @Override
+    protected void onPause() {
+        ui.removeCallbacks(floatTick);
+        super.onPause();
     }
 
     private SharedPreferences prefs() {
@@ -1446,7 +1617,7 @@ public class MainActivity extends Activity {
         drawer.addView(head);
 
         TextView ver = new TextView(this);
-        ver.setText("2.7.11   支持网易版 / 国际基岩版");
+        ver.setText("2.7.47   支持网易版 / 国际基岩版");
         ver.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
         ver.setTextColor(C_HINT);
         ver.setPadding(dp(18), 0, dp(18), dp(12));
@@ -1457,13 +1628,27 @@ public class MainActivity extends Activity {
                 if (detailMode || backupMode || settingsMode) showListScreen();
             }
         });
-        addDrawerItem("备份管理", new Runnable() { public void run() { showBackupScreen(); } });
+        addDrawerItem("备份管理", new Runnable() {
+            public void run() {
+                // 已经在备份页（且不是详情页）就只关抽屉，不重建页面
+                if (!backupMode || detailMode) showBackupScreen();
+            }
+        });
         addDrawerDivider();
+        addDrawerItem("日志", new Runnable() {
+            public void run() { showLogScreen(); }
+        });
         addDrawerItem("关于本工具", new Runnable() { public void run() { showAbout(); } });
-        addDrawerItem("设置", new Runnable() { public void run() { showSettings(); } });
+        addDrawerItem("设置", new Runnable() {
+            public void run() {
+                if (!settingsMode) showSettings();
+            }
+        });
 
+        pagePrep(rootCol);
         setContentView(frame, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT));
+        pageStart(rootCol);
     }
 
     private void addDrawerDivider() {
@@ -1518,6 +1703,7 @@ public class MainActivity extends Activity {
     private void openDrawer() {
         if (drawer == null) return;
         drawerOpen = true;
+        if (backupBar != null && backupSelecting) backupBar.setVisibility(View.GONE);
         drawer.animate().cancel();
         overlay.setVisibility(View.VISIBLE);
         overlay.animate().cancel();
@@ -1550,6 +1736,7 @@ public class MainActivity extends Activity {
                 .withEndAction(new Runnable() {
                     public void run() {
                         if (overlay != null) overlay.setVisibility(View.GONE);
+                        if (backupBar != null && backupSelecting) backupBar.setVisibility(View.VISIBLE);
                         if (after != null) after.run();
                     }
                 }).start();
@@ -1557,6 +1744,70 @@ public class MainActivity extends Activity {
 
     private static final int OPEN_MS = 220;
     private static final int CLOSE_MS = 220;
+
+    private void showLogScreen() {
+        detailMode = false;
+        backupMode = false;
+        settingsMode = false;
+
+        ScrollView scroll = new ScrollView(this);
+        LinearLayout root = column();
+        root.setPadding(dp(16), dp(4), dp(16), dp(24));
+        scroll.addView(root);
+
+        sectionTitle(root, "日志文件");
+        LinearLayout box = cardBox(root);
+        TextView path = text(AppLog.file().getAbsolutePath(), 11, false, C_HINT);
+        path.setSingleLine(true);
+        path.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+        box.addView(path);
+
+        File f = AppLog.file();
+        String meta = (f.isFile() ? WorldStore.sizeText(f.length()) : "0 B")
+                + (f.isFile() ? "    " + WorldStore.timeText(f.lastModified()) : "");
+        box.addView(text(meta, 11, false, C_SUB));
+
+        LinearLayout op = row(box);
+        Button refresh = chip(op, "刷新");
+        refresh.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { showLogScreen(); }
+        });
+        Button copy = chip(op, "复制全部");
+        copy.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                try {
+                    android.content.ClipboardManager cm = (android.content.ClipboardManager)
+                            getSystemService(CLIPBOARD_SERVICE);
+                    cm.setPrimaryClip(android.content.ClipData.newPlainText("日志", AppLog.readTail(200000)));
+                    bottomNotice("日志已复制到剪贴板", true);
+                } catch (Throwable t) {
+                    bottomNotice("复制失败：" + t.getMessage(), true);
+                }
+            }
+        });
+
+        TextView body = text(AppLog.readTail(120000), 11, false, C_TEXT);
+        body.setTypeface(Typeface.MONOSPACE);
+        body.setTextIsSelectable(true);
+        body.setLineSpacing(dp(2), 1f);
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        blp.topMargin = dp(12);
+        root.addView(body, blp);
+
+        shell(scroll, "日志", "清空", new Runnable() {
+            public void run() {
+                cardDialog("清空日志", "会删掉当前日志文件里的全部内容，无法恢复。",
+                        "清空", new Runnable() {
+                            public void run() {
+                                AppLog.clear();
+                                AppLog.i("应用", "日志已清空");
+                                showLogScreen();
+                            }
+                        }, "取消", true);
+            }
+        });
+    }
 
     private void showSettings() {
         detailMode = false;
@@ -1583,7 +1834,7 @@ public class MainActivity extends Activity {
                 new int[]{android.R.attr.state_checked},
                 new int[]{}
         };
-        sw.setTrackTintList(new ColorStateList(states, new int[]{0x552F6FED, C_BTN_STROKE}));
+        sw.setTrackTintList(new ColorStateList(states, new int[]{0x882F6FED, C_BTN_STROKE}));
         sw.setThumbTintList(new ColorStateList(states, new int[]{C_ACCENT, C_HINT}));
         sw.setChecked(prefBool(KEY_INTL, true));
         row.addView(sw, new LinearLayout.LayoutParams(
@@ -1610,6 +1861,84 @@ public class MainActivity extends Activity {
             }
         });
 
+        sectionTitle(root, "小窗");
+        LinearLayout boxFloat = cardBox(root);
+        LinearLayout rowF = row(boxFloat);
+        rowF.setGravity(Gravity.CENTER_VERTICAL);
+        TextView lbF = text("小窗模式（蓝色悬浮圆钮）", 15, true, C_TEXT);
+        rowF.addView(lbF, new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        final Switch swF = new Switch(this);
+        swF.setTrackTintList(new ColorStateList(states, new int[]{0x882F6FED, C_BTN_STROKE}));
+        swF.setThumbTintList(new ColorStateList(states, new int[]{C_ACCENT, C_HINT}));
+        swF.setChecked(prefBool(KEY_FLOAT, false));
+        rowF.addView(swF, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        TextView noteF = text("开启后屏幕上常驻一个蓝色圆形按钮，点它列出存档；点卡片进入简易编辑，只保留「修改 NBT（JSON 编辑 / 快速附魔）」与「清空非玩家生物」两项。需要授予「显示在其他应用上层」权限。",
+                12, false, C_HINT);
+        noteF.setLineSpacing(dp(3), 1f);
+        noteF.setPadding(0, dp(10), 0, 0);
+        boxFloat.addView(noteF);
+
+        floatStateView = text("", 11, false, C_HINT);
+        floatStateView.setLineSpacing(dp(3), 1f);
+        floatStateView.setPadding(0, dp(8), 0, 0);
+        boxFloat.addView(floatStateView);
+        updateFloatState(android.provider.Settings.canDrawOverlays(this));
+
+        LinearLayout fixRow = row(boxFloat);
+        Button btnFix = chip(fixRow, "重新授权 / 重启小窗");
+        btnFix.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                boolean perm = android.provider.Settings.canDrawOverlays(MainActivity.this);
+                if (!perm) {
+                    try {
+                        startActivity(new Intent(android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                Uri.parse("package:" + getPackageName())));
+                    } catch (Throwable t) {
+                        Toast.makeText(MainActivity.this, "请到系统设置里手动授予悬浮窗权限",
+                                Toast.LENGTH_LONG).show();
+                    }
+                    return;
+                }
+                FloatService.stop(MainActivity.this);
+                FloatService.start(MainActivity.this);
+                Toast.makeText(MainActivity.this, "已重启小窗，1 秒内若仍未出现请看上面的状态",
+                        Toast.LENGTH_SHORT).show();
+                updateFloatState(true);
+            }
+        });
+
+        swF.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
+            public void onCheckedChanged(CompoundButton b, boolean checked) {
+                setPrefBool(KEY_FLOAT, checked);
+                if (!checked) {
+                    ui.removeCallbacks(floatTick);
+                    FloatService.stop(MainActivity.this);
+                    updateFloatState(android.provider.Settings.canDrawOverlays(MainActivity.this));
+                    return;
+                }
+                if (!android.provider.Settings.canDrawOverlays(MainActivity.this)) {
+                    Toast.makeText(MainActivity.this,
+                            "请先允许「显示在其他应用上层」，返回后自动生效", Toast.LENGTH_LONG).show();
+                    try {
+                        startActivity(new Intent(android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                Uri.parse("package:" + getPackageName())));
+                    } catch (Throwable t) {
+                        Toast.makeText(MainActivity.this, "请到系统设置里手动授予悬浮窗权限",
+                                Toast.LENGTH_LONG).show();
+                    }
+                    return;
+                }
+                FloatService.start(MainActivity.this);
+                ui.removeCallbacks(floatTick);
+                ui.post(floatTick);
+                updateFloatState(true);
+                Toast.makeText(MainActivity.this, "小窗模式已开启", Toast.LENGTH_SHORT).show();
+            }
+        });
+
         sectionTitle(root, "外观");
         LinearLayout box3 = cardBox(root);
         LinearLayout row3 = row(box3);
@@ -1618,7 +1947,7 @@ public class MainActivity extends Activity {
         row3.addView(lb3, new LinearLayout.LayoutParams(0,
                 ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         final Switch sw3 = new Switch(this);
-        sw3.setTrackTintList(new ColorStateList(states, new int[]{0x552F6FED, C_BTN_STROKE}));
+        sw3.setTrackTintList(new ColorStateList(states, new int[]{0x882F6FED, C_BTN_STROKE}));
         sw3.setThumbTintList(new ColorStateList(states, new int[]{C_ACCENT, C_HINT}));
         sw3.setChecked(DARK);
         row3.addView(sw3, new LinearLayout.LayoutParams(
@@ -1639,7 +1968,7 @@ public class MainActivity extends Activity {
 
         sectionTitle(root, "写入与备份");
         LinearLayout box2 = cardBox(root);
-        TextView info = text("每次写回前自动备份到 /sdcard/NM存档备份，失败自动回滚；写入前请先在游戏内退出该世界并结束游戏进程。",
+        TextView info = text("每次写回前自动备份到 /sdcard/NM存档备份，失败自动回滚；写入前请先在游戏内退出该世界（不必关整个游戏）；若游戏仍在后台持有该世界，写入可能被覆盖。",
                 12, false, C_HINT);
         info.setLineSpacing(dp(3), 1f);
         box2.addView(info);
@@ -1902,7 +2231,7 @@ public class MainActivity extends Activity {
         c2.addView(text("基岩版：附魔存在物品 tag 下的 ench 列表，每项 {id, lvl}。id 是附魔数字 ID，lvl 1-32767（short 上限，网易版可写满）。",
                 11, false, C_HINT));
 
-        final Spinner spEnch = spinner(c2, ENCH_LABELS);
+        final Picker spEnch = spinner(c2, ENCH_LABELS);
         LinearLayout lvlRow = row(c2);
         lvlRow.setGravity(Gravity.CENTER_VERTICAL);
         TextView lvlLabel = text("等级", 12, false, C_HINT);
@@ -2009,10 +2338,10 @@ public class MainActivity extends Activity {
     }
 
     /** 附魔数字 ID（基岩版数据值）。 */
-    private static final int[] ENCH_IDS = {
+    static final int[] ENCH_IDS = {
             0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
             19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36};
-    private static final String[] ENCH_LABELS = {
+    static final String[] ENCH_LABELS = {
             "0 保护", "1 火焰保护", "2 摔落保护", "3 爆炸保护", "4 弹射物保护", "5 荆棘",
             "6 水下呼吸", "7 深海探索者", "8 水下速掘", "9 锋利", "10 亡灵杀手", "11 节肢杀手",
             "12 击退", "13 火焰附加", "14 抢夺", "15 效率", "16 精准采集", "17 耐久", "18 时运",
@@ -2241,7 +2570,7 @@ public class MainActivity extends Activity {
 
         bodyCol.addView(sectionLabel("写入安全"));
         TextView safe = text("每次写入前自动备份到 /sdcard/NM存档备份，失败自动回滚。"
-                + "写入前请先在游戏内退出该世界并结束游戏进程。", 12, false, C_SUB);
+                + "写入前请先在游戏内退出该世界（不必关整个游戏）；若游戏仍在后台持有该世界，写入可能被覆盖。", 12, false, C_SUB);
         safe.setLineSpacing(dp(4), 1f);
         bodyCol.addView(safe);
 
@@ -2317,7 +2646,9 @@ public class MainActivity extends Activity {
             win.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(0x00000000));
             win.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
         }
+        popPrep(card);
         dlg.show();
+        popStart(card);
         // 卡片高度按内容，但不超出可用高度（超高时正文区滚动）
         root.post(new Runnable() {
             public void run() {
@@ -2347,6 +2678,13 @@ public class MainActivity extends Activity {
         detailMode = false;
         backupMode = true;
         settingsMode = false;
+        backupSelecting = false;
+        backupSel.clear();
+        backupMarks.clear();
+        backupBar = null;
+        backupBarCount = null;
+        backupSelUi = null;
+
         ScrollView scroll = new ScrollView(this);
         LinearLayout root = column();
         root.setPadding(dp(16), dp(16), dp(16), dp(24));
@@ -2364,81 +2702,399 @@ public class MainActivity extends Activity {
 
         TextView rf = link(root, "刷新列表 ›");
         rf.setOnClickListener(new View.OnClickListener() {
-            public void onClick(View v) { showBackupScreen(); }
+            public void onClick(View v) {
+                fillBackupList();          // 只重扫、重填列表区
+                buildBackupSelectBar(backupItems); // 多选条换成新数据
+                bottomNotice("已刷新列表", true);
+            }
         });
 
-        final LinearLayout list = column();
-        root.addView(list);
+        backupSummaryView = text("", 13, false, C_SUB);
+        root.addView(backupSummaryView);
 
-        final List<WorldStore.BackupEntry> items = WorldStore.listBackups();
+        backupListCol = column();
+        root.addView(backupListCol);
+
+        fillBackupList();
+
+        shell(scroll, "备份管理", null, null);
+        buildBackupSelectBar(backupItems);
+    }
+
+    /** 扫描备份目录并把列表区整个重填（卡片、合计、勾选状态），不动页面骨架。 */
+    private void fillBackupList() {
+        if (backupListCol == null) return;
+        backupListCol.removeAllViews();
+        backupMarks.clear();
+        backupSelecting = false;
+        backupSel.clear();
+        if (backupBar != null) {
+            ViewGroup p = (ViewGroup) backupBar.getParent();
+            if (p != null) p.removeView(backupBar);
+            backupBar = null;
+        }
+
+        final java.util.List<WorldStore.BackupEntry> items = WorldStore.listBackups();
+        backupItems = items;
         if (items.isEmpty()) {
-            root.addView(text("这个目录里还没有备份。\n在存档列表里点「备份到手机」就会生成。", 14, false, C_SUB));
-        } else {
-            root.addView(text("共 " + items.size() + " 个备份，点某个可查看说明或删除", 13, false, C_SUB));
+            if (backupSummaryView != null) backupSummaryView.setText("");
+            backupListCol.addView(text("这个目录里还没有备份。\n在存档列表里点「备份到手机」就会生成。", 14, false, C_SUB));
+            return;
+        }
+        if (backupSummaryView != null) {
+            backupSummaryView.setText("共 " + items.size() + " 个备份，点卡片看详情，长按可多选删除");
         }
         long total = 0;
         for (final WorldStore.BackupEntry b : items) {
             total += b.size;
             LinearLayout card = column();
             card.setPadding(dp(14), dp(12), dp(14), dp(12));
-            card.setBackground(bg(C_CARD, 12, C_STROKE));
-            card.setClickable(true);
-            card.addView(text(b.name, 15, true, C_TEXT));
-            card.addView(text(b.type + "    世界 ID：" + b.worldId, 12, false, C_SUB));
-            card.addView(text(WorldStore.sizeText(b.size) + "    " + WorldStore.timeText(b.time), 12, false, C_SUB));
+            applyCardRipple(card);
+
+            LinearLayout rowWrap = new LinearLayout(this);
+            rowWrap.setOrientation(LinearLayout.HORIZONTAL);
+            rowWrap.setGravity(Gravity.CENTER_VERTICAL);
+            LinearLayout col = column();
+            col.addView(text(b.name, 15, true, C_TEXT));
+            col.addView(text(b.type + "    世界 ID：" + b.worldId, 12, false, C_SUB));
+            col.addView(text(WorldStore.sizeText(b.size) + "    " + WorldStore.timeText(b.time), 12, false, C_SUB));
+            rowWrap.addView(col, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+            final TextView mark = makeSelectMark();
+            LinearLayout.LayoutParams mlp = new LinearLayout.LayoutParams(dp(24), dp(24));
+            mlp.leftMargin = dp(8);
+            rowWrap.addView(mark, mlp);
+            backupMarks.put(b.dir.getAbsolutePath(), mark);
+            card.addView(rowWrap);
+
             card.setOnClickListener(new View.OnClickListener() {
-                public void onClick(View v) { showBackupDetail(b); }
+                public void onClick(View v) {
+                    if (backupSelecting) toggleBackupPick(b, mark);
+                    else showBackupDetail(b);
+                }
+            });
+            card.setOnLongClickListener(new View.OnLongClickListener() {
+                public boolean onLongClick(View v) {
+                    if (items.isEmpty()) return false;
+                    if (!backupSelecting) enterBackupSelect();
+                    toggleBackupPick(b, mark);
+                    return true;
+                }
             });
             LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
             lp.topMargin = dp(10);
-            list.addView(card, lp);
+            backupListCol.addView(card, lp);
         }
-        if (!items.isEmpty()) {
-            root.addView(text("合计占用 " + WorldStore.sizeText(total), 12, false, C_HINT));
-        }
+        backupListCol.addView(text("合计占用 " + WorldStore.sizeText(total), 12, false, C_HINT));
+    }
 
-        shell(scroll, "备份管理", null, null);
+    /** 多选小圆点：未选=空心描边，已选=主题色实心 + 白勾。 */
+    private TextView makeSelectMark() {
+        TextView tv = new TextView(this);
+        tv.setText("\u2713");
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        tv.setGravity(Gravity.CENTER);
+        tv.setTextColor(0xFFFFFFFF);
+        tv.setVisibility(View.GONE);
+        paintSelectMark(tv, false);
+        return tv;
+    }
+
+    private void paintSelectMark(TextView tv, boolean on) {
+        GradientDrawable g = new GradientDrawable();
+        g.setShape(GradientDrawable.OVAL);
+        g.setColor(on ? C_ACCENT : 0x00000000);
+        if (!on) g.setStroke(dp(1), C_STROKE);
+        tv.setBackground(g);
+        tv.setTextColor(on ? 0xFFFFFFFF : 0x00000000);
+    }
+
+    private int dangerColor() {
+        return DARK ? 0xFFFF7878 : 0xFFD93025;
+    }
+
+    private TextView dialogButton(String label, int color) {
+        TextView b = new TextView(this);
+        b.setText(label);
+        b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        b.setTypeface(null, Typeface.BOLD);
+        b.setTextColor(color);
+        b.setGravity(Gravity.CENTER);
+        b.setPadding(dp(12), dp(11), dp(12), dp(11));
+        b.setClickable(true);
+        GradientDrawable mask = new GradientDrawable();
+        mask.setColor(0xFF000000);
+        mask.setCornerRadius(dp(8));
+        b.setBackground(new RippleDrawable(ColorStateList.valueOf(0x332F6FED), null, mask));
+        return b;
+    }
+
+    /** 自绘圆角弹窗：标题 + 可滚动正文 + 底部两个文字按钮（与「关于本工具」同风格）。 */
+    private Dialog cardDialog(String title, String body, String posLabel, final Runnable posAction,
+                              String negLabel, boolean posDanger) {
+        final Dialog dlg = new Dialog(this, android.R.style.Theme_Translucent_NoTitleBar);
+        FrameLayout root = new FrameLayout(this);
+        root.setBackgroundColor(0x99000000);
+        root.setPadding(dp(20), dp(24), dp(20), dp(24));
+        root.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { dlg.dismiss(); }
+        });
+
+        LinearLayout card = column();
+        card.setBackground(bg(C_CARD, 14, C_STROKE));
+        card.setPadding(dp(18), dp(16), dp(18), dp(8));
+        card.setClickable(true);
+
+        TextView tvTitle = text(title, 17, true, C_TEXT);
+        tvTitle.setSingleLine(false);
+        card.addView(tvTitle);
+
+        final ScrollView bodyScroll = new ScrollView(this);
+        TextView bodyTv = text(body, 13, false, C_SUB);
+        bodyTv.setLineSpacing(dp(4), 1f);
+        bodyTv.setTextIsSelectable(true);
+        bodyScroll.addView(bodyTv, new ScrollView.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        blp.topMargin = dp(10);
+        card.addView(bodyScroll, blp);
+
+        View hair = new View(this);
+        hair.setBackgroundColor(C_STROKE);
+        LinearLayout.LayoutParams hLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(1));
+        hLp.topMargin = dp(10);
+        card.addView(hair, hLp);
+
+        LinearLayout btnRow = new LinearLayout(this);
+        btnRow.setOrientation(LinearLayout.HORIZONTAL);
+        btnRow.setGravity(Gravity.END);
+        if (negLabel != null) {
+            TextView neg = dialogButton(negLabel, C_SUB);
+            neg.setOnClickListener(new View.OnClickListener() {
+                public void onClick(View v) { dlg.dismiss(); }
+            });
+            btnRow.addView(neg);
+        }
+        TextView pos = dialogButton(posLabel, posDanger ? dangerColor() : C_ACCENT);
+        pos.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                dlg.dismiss();
+                if (posAction != null) posAction.run();
+            }
+        });
+        LinearLayout.LayoutParams plp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        plp.leftMargin = dp(8);
+        btnRow.addView(pos, plp);
+        card.addView(btnRow, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        FrameLayout.LayoutParams clp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        clp.gravity = Gravity.CENTER;
+        clp.topMargin = dp(18);
+        clp.bottomMargin = dp(18);
+        root.addView(card, clp);
+
+        dlg.setContentView(root);
+        dlg.setCanceledOnTouchOutside(true);
+        android.view.Window win = dlg.getWindow();
+        if (win != null) {
+            win.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(0x00000000));
+            win.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
+        }
+        popPrep(card);
+        dlg.show();
+        popStart(card);
+        root.addOnLayoutChangeListener(new View.OnLayoutChangeListener() {
+            public void onLayoutChange(View v, int l, int t, int r, int b, int ol, int ot, int or, int ob) {
+                int max = (b - t) - root.getPaddingTop() - root.getPaddingBottom()
+                        - clp.topMargin - clp.bottomMargin;
+                if (max <= 0 || card.getHeight() <= max) return;
+                int fixed = card.getHeight() - bodyScroll.getHeight();
+                LinearLayout.LayoutParams lp2 = (LinearLayout.LayoutParams) bodyScroll.getLayoutParams();
+                lp2.height = Math.max(max - fixed, dp(72));
+                bodyScroll.setLayoutParams(lp2);
+            }
+        });
+        return dlg;
     }
 
     private void showBackupDetail(final WorldStore.BackupEntry b) {
         String note = WorldStore.readNote(b.dir);
-        new AlertDialog.Builder(this)
-                .setTitle(b.name)
-                .setMessage(note + "\n路径：\n" + b.dir.getAbsolutePath())
-                .setPositiveButton("删除这个备份", new android.content.DialogInterface.OnClickListener() {
-                    public void onClick(android.content.DialogInterface d, int which) { confirmDeleteBackup(b); }
-                })
-                .setNegativeButton("关闭", null)
-                .show();
+        String origin = "（说明文件里没有记录原始路径）";
+        if (note != null) {
+            for (String line : note.split("\n")) {
+                if (line.trim().startsWith("目录：")) { origin = line.trim().substring(3).trim(); break; }
+            }
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append("世界名：").append(b.name).append("\n");
+        sb.append("原始目录：").append(origin).append("\n");
+        sb.append("类型：").append(b.type).append("\n");
+        sb.append("时间：").append(WorldStore.timeText(b.time))
+                .append("\n体积：").append(WorldStore.sizeText(b.size)).append("\n");
+        if (note != null && note.trim().length() > 0) {
+            sb.append("\n").append(note.trim()).append("\n");
+        }
+        sb.append("\n还原：把本目录下 ").append(b.worldId)
+                .append(" 整个文件夹复制回 minecraftWorlds 覆盖即可。");
+        sb.append("\n\n备份路径：\n").append(b.dir.getAbsolutePath());
+        cardDialog(b.name, sb.toString(), "删除这个备份",
+                new Runnable() { public void run() { confirmDeleteBackup(b); } },
+                "关闭", true);
     }
 
     private void confirmDeleteBackup(final WorldStore.BackupEntry b) {
-        new AlertDialog.Builder(this)
-                .setTitle("确认删除")
-                .setMessage("将永久删除：\n" + b.name + "\n（" + WorldStore.sizeText(b.size) + "）\n\n删除后无法恢复，原存档不受影响。")
-                .setPositiveButton("删除", new android.content.DialogInterface.OnClickListener() {
-                    public void onClick(android.content.DialogInterface d, int which) {
+        cardDialog("确认删除",
+                "将永久删除：\n" + b.name + "\n（" + WorldStore.sizeText(b.size) + "）\n\n"
+                        + "删除后无法恢复，原存档不受影响。",
+                "删除",
+                new Runnable() {
+                    public void run() {
                         try {
                             WorldStore.deleteBackup(b.dir);
                             showBackupScreen();
+                            bottomNotice("已删除备份：" + b.name, true);
                         } catch (Throwable e) {
-                            new AlertDialog.Builder(MainActivity.this)
-                                    .setTitle("删除失败")
-                                    .setMessage(friendlyError(e))
-                                    .setPositiveButton("知道了", null)
-                                    .show();
+                            cardDialog("删除失败", friendlyError(e), "知道了", null, null, false);
                         }
                     }
-                })
-                .setNegativeButton("取消", null)
-                .show();
+                },
+                "取消", true);
+    }
+
+    // ---------------------------------------------------------------- 备份多选
+    private void buildBackupSelectBar(final List<WorldStore.BackupEntry> items) {
+        backupBar = new LinearLayout(this);
+        backupBar.setOrientation(LinearLayout.HORIZONTAL);
+        backupBar.setGravity(Gravity.CENTER_VERTICAL);
+        backupBar.setBackground(bg(C_CARD, 14, C_STROKE));
+        backupBar.setPadding(dp(10), dp(5), dp(10), dp(5));
+        backupBar.setElevation(dp(8));
+        backupBar.setVisibility(View.GONE);
+
+        backupBarCount = text("已选 0 项", 13, false, C_SUB);
+        backupBar.addView(backupBarCount, new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        TextView all = dialogButton("全选", C_ACCENT);
+        all.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        all.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                if (backupSel.size() == items.size()) backupSel.clear();
+                else {
+                    backupSel.clear();
+                    for (WorldStore.BackupEntry b : items) backupSel.add(b.dir.getAbsolutePath());
+                }
+                refreshBackupSel(items);
+            }
+        });
+        backupBar.addView(all);
+
+        TextView del = dialogButton("删除", dangerColor());
+        del.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        del.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { confirmDeleteSelected(items); }
+        });
+        backupBar.addView(del);
+
+        TextView cancel = dialogButton("取消", C_SUB);
+        cancel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        cancel.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { exitBackupSelect(); }
+        });
+        backupBar.addView(cancel);
+
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.gravity = Gravity.BOTTOM;
+        lp.leftMargin = dp(16);
+        lp.rightMargin = dp(16);
+        lp.bottomMargin = dp(16);
+        frame.addView(backupBar, lp);
+
+        backupSelUi = new Runnable() { public void run() { refreshBackupSel(items); } };
+    }
+
+    private void enterBackupSelect() {
+        backupSelecting = true;
+        if (backupBar != null) {
+            backupBar.setVisibility(View.VISIBLE);
+            backupBar.setAlpha(0f);
+            backupBar.setTranslationY(dp(16));
+            backupBar.animate().alpha(1f).translationY(0f).setDuration(160).start();
+        }
+        for (TextView m : backupMarks.values()) m.setVisibility(View.VISIBLE);
+        if (backupSelUi != null) backupSelUi.run();
+    }
+
+    private void exitBackupSelect() {
+        backupSelecting = false;
+        backupSel.clear();
+        if (backupBar != null) backupBar.setVisibility(View.GONE);
+        for (TextView m : backupMarks.values()) {
+            m.setVisibility(View.GONE);
+            paintSelectMark(m, false);
+        }
+        if (backupBarCount != null) backupBarCount.setText("已选 0 项");
+    }
+
+    private void toggleBackupPick(WorldStore.BackupEntry b, TextView mark) {
+        String key = b.dir.getAbsolutePath();
+        if (!backupSel.remove(key)) backupSel.add(key);
+        paintSelectMark(mark, backupSel.contains(key));
+        if (backupBarCount != null) backupBarCount.setText("已选 " + backupSel.size() + " 项");
+    }
+
+    private void refreshBackupSel(List<WorldStore.BackupEntry> items) {
+        for (WorldStore.BackupEntry b : items) {
+            TextView m = backupMarks.get(b.dir.getAbsolutePath());
+            if (m != null) paintSelectMark(m, backupSel.contains(b.dir.getAbsolutePath()));
+        }
+        if (backupBarCount != null) backupBarCount.setText("已选 " + backupSel.size() + " 项");
+    }
+
+    private void confirmDeleteSelected(final List<WorldStore.BackupEntry> items) {
+        if (backupSel.isEmpty()) { bottomNotice("先选要删除的备份", true); return; }
+        StringBuilder sb = new StringBuilder("将永久删除 " + backupSel.size() + " 个备份：\n");
+        int n = 0;
+        for (WorldStore.BackupEntry b : items) {
+            if (!backupSel.contains(b.dir.getAbsolutePath())) continue;
+            if (n < 6) sb.append("· ").append(b.name).append("（")
+                    .append(WorldStore.sizeText(b.size)).append("）\n");
+            n++;
+        }
+        if (n > 6) sb.append("· 其余 ").append(n - 6).append(" 个…\n");
+        sb.append("\n删除后无法恢复，原存档不受影响。");
+        cardDialog("确认删除", sb.toString(), "全部删除",
+                new Runnable() {
+                    public void run() {
+                        int ok = 0, fail = 0;
+                        for (WorldStore.BackupEntry b : items) {
+                            if (!backupSel.contains(b.dir.getAbsolutePath())) continue;
+                            try { WorldStore.deleteBackup(b.dir); ok++; }
+                            catch (Throwable e) { fail++; }
+                        }
+                        showBackupScreen();
+                        bottomNotice(fail == 0 ? ("已删除 " + ok + " 个备份")
+                                : ("删除完成：" + ok + " 个成功，" + fail + " 个失败"), true);
+                    }
+                },
+                "取消", true);
     }
 
     @Override
     public void onBackPressed() {
         if (drawerOpen) {
             closeDrawer();
+            return;
+        }
+        if (backupSelecting) {
+            exitBackupSelect();
             return;
         }
         if (detailMode || backupMode || settingsMode) {
@@ -2606,6 +3262,161 @@ public class MainActivity extends Activity {
     }
 
     // ================================================================ 小工具
+    /**
+     * 折叠/展开高度动画：show=true 从 0 拉到自然高度，false 收回 0 后再 GONE。
+     * 用 view 的 tag 存当前动画，连点时先 cancel 旧的，被取消的那次不会再改状态。
+     */
+    private void foldAnimate(final View box, final boolean show) {
+        Object prev = box.getTag();
+        if (prev instanceof ValueAnimator) {
+            ((ValueAnimator) prev).cancel();
+        }
+        int startH = show ? 0 : Math.max(box.getHeight(), 0);
+        int endH;
+        if (show) {
+            box.setVisibility(View.VISIBLE);
+            ViewGroup.LayoutParams lp0 = box.getLayoutParams();
+            if (lp0 != null) {
+                lp0.height = 0;
+                box.setLayoutParams(lp0);
+            }
+            int w = box.getWidth();
+            if (w <= 0 && box.getParent() instanceof View) {
+                View pv = (View) box.getParent();
+                w = pv.getWidth() - pv.getPaddingLeft() - pv.getPaddingRight();
+            }
+            int natural = 0;
+            try {
+                if (w > 0) {
+                    box.measure(View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.EXACTLY),
+                            View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED));
+                    natural = box.getMeasuredHeight();
+                }
+            } catch (Throwable ignored) {
+            }
+            if (natural <= 0) {
+                // 量不出来就退化成直接显示，绝不把内容卡在 0 高度
+                ViewGroup.LayoutParams lp = box.getLayoutParams();
+                if (lp != null) lp.height = ViewGroup.LayoutParams.WRAP_CONTENT;
+                box.setLayoutParams(lp);
+                return;
+            }
+            endH = natural;
+        } else {
+            endH = 0;
+        }
+        final boolean[] aborted = {false};
+        ValueAnimator va = ValueAnimator.ofInt(startH, endH);
+        va.setDuration(show ? 260 : 220);
+        va.addUpdateListener(new ValueAnimator.AnimatorUpdateListener() {
+            public void onAnimationUpdate(ValueAnimator a) {
+                ViewGroup.LayoutParams lp = box.getLayoutParams();
+                if (lp == null) return;
+                lp.height = (int) a.getAnimatedValue();
+                box.setLayoutParams(lp);
+            }
+        });
+        va.addListener(new android.animation.AnimatorListenerAdapter() {
+            public void onAnimationCancel(android.animation.Animator a) { aborted[0] = true; }
+            public void onAnimationEnd(android.animation.Animator a) {
+                if (aborted[0]) return;
+                box.setTag(null);
+                ViewGroup.LayoutParams lp = box.getLayoutParams();
+                if (lp != null) {
+                    lp.height = show ? ViewGroup.LayoutParams.WRAP_CONTENT : 0;
+                    box.setLayoutParams(lp);
+                }
+                if (!show) box.setVisibility(View.GONE);
+            }
+        });
+        box.setTag(va);
+        va.start();
+    }
+
+    /**
+     * 弹窗入场分两步：必须在 dialog.show() 之前先摆好初始状态（透明 + 94% + 上浮），
+     * 否则第一帧会先按正常大小画出来，再缩回去重放，看起来像闪一下。
+     */
+    private void popPrep(View card) {
+        card.setAlpha(0f);
+        card.setScaleX(0.94f);
+        card.setScaleY(0.94f);
+        card.setTranslationY(dp(10));
+    }
+
+    private void popStart(View card) {
+        card.animate().alpha(1f).scaleX(1f).scaleY(1f).translationY(0f)
+                .setDuration(200)
+                .setInterpolator(new android.view.animation.DecelerateInterpolator())
+                .start();
+    }
+
+    /** 整页入场：挂到窗口前先透明上移，挂上后再淡入下滑，避免首帧闪现。 */
+    private void pagePrep(View page) {
+        page.setAlpha(0f);
+        page.setTranslationY(dp(10));
+    }
+
+    private void pageStart(View page) {
+        page.animate().alpha(1f).translationY(0f)
+                .setDuration(220)
+                .setInterpolator(new android.view.animation.DecelerateInterpolator())
+                .start();
+    }
+
+    /**
+     * 卡片点击反馈：在手指按下坐标画一个小圆，轻微扩散后淡出。
+     * 不用 RippleDrawable——它的 hotspot 拿不到手指坐标时会落在视图中心，
+     * 看起来就是“卡片中间冒一个圆”，没有意义。
+     */
+    private void applyCardRipple(final View card) {
+        card.setBackground(bg(C_CARD, 12, C_STROKE));
+        card.setClickable(true);
+        card.setOnTouchListener(new View.OnTouchListener() {
+            public boolean onTouch(View v, MotionEvent e) {
+                if (e.getActionMasked() == MotionEvent.ACTION_DOWN) showTouchDot(v, e.getX(), e.getY());
+                return false;   // 不吃事件：点击、长按多选行为不变
+            }
+        });
+    }
+
+    private void showTouchDot(final View v, final float x, final float y) {
+        Object prev = v.getTag();
+        if (prev instanceof ValueAnimator) ((ValueAnimator) prev).cancel();
+
+        final GradientDrawable dot = new GradientDrawable();
+        dot.setShape(GradientDrawable.OVAL);
+        dot.setColor(0x402F6FED);
+        try {
+            v.getOverlay().add(dot);
+        } catch (Throwable t) {
+            return;
+        }
+        final boolean[] aborted = {false};
+        ValueAnimator va = ValueAnimator.ofFloat(0f, 1f);
+        va.setDuration(320);
+        va.addUpdateListener(new ValueAnimator.AnimatorUpdateListener() {
+            public void onAnimationUpdate(ValueAnimator a) {
+                float f = (float) a.getAnimatedValue();
+                float r = dp(10) + dp(22) * f;          // 从 10dp 扩到 32dp
+                dot.setBounds((int) (x - r), (int) (y - r), (int) (x + r), (int) (y + r));
+                dot.setAlpha((int) (0x40 * (1f - 0.6f * f)));
+            }
+        });
+        va.addListener(new android.animation.AnimatorListenerAdapter() {
+            public void onAnimationCancel(android.animation.Animator a) { aborted[0] = true; }
+            public void onAnimationEnd(android.animation.Animator a) {
+                try {
+                    v.getOverlay().remove(dot);
+                } catch (Throwable ignored) {
+                }
+                if (v.getTag() == a) v.setTag(null);
+            }
+        });
+        v.setTag(va);
+        va.start();
+    }
+
     private LinearLayout column() {
         LinearLayout l = new LinearLayout(this);
         l.setOrientation(LinearLayout.VERTICAL);
@@ -2615,8 +3426,10 @@ public class MainActivity extends Activity {
     private LinearLayout row(LinearLayout parent) {
         LinearLayout l = new LinearLayout(this);
         l.setOrientation(LinearLayout.HORIZONTAL);
-        parent.addView(l, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        if (parent.getChildCount() > 0) lp.topMargin = dp(8);
+        parent.addView(l, lp);
         return l;
     }
 
@@ -2667,8 +3480,10 @@ public class MainActivity extends Activity {
         et.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
         styleInput(et);
         et.setInputType(InputType.TYPE_CLASS_TEXT);
-        parent.addView(et, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        if (parent.getChildCount() > 0) lp.topMargin = dp(8);
+        parent.addView(et, lp);
         return et;
     }
 
@@ -2684,19 +3499,22 @@ public class MainActivity extends Activity {
         } else {
             et.setInputType(InputType.TYPE_CLASS_NUMBER);
         }
-        parent.addView(et, new LinearLayout.LayoutParams(0,
-                ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        // 同一行多个输入框之间留 8dp 缝，避免圆角边框贴在一起看着像叠在一起
+        if (parent.getChildCount() > 0) lp.leftMargin = dp(8);
+        parent.addView(et, lp);
         return et;
     }
 
-    private Spinner spinner(LinearLayout parent, String[] items) {
-        Spinner sp = new Spinner(this);
-        TintAdapter ad = new TintAdapter(this, items);
-        sp.setPopupBackgroundDrawable(bg(C_CARD, 8, C_STROKE));
-        sp.setAdapter(ad);
-        parent.addView(sp, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-        return sp;
+    private Picker spinner(LinearLayout parent, String[] items) {
+        Picker p = new Picker();
+        p.setItems(items);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.topMargin = dp(2);
+        parent.addView(p, lp);
+        return p;
     }
 
     /** 输入框统一外观（浅色/深色都跟随主题）。 */
@@ -2717,26 +3535,236 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** 下拉框文字跟随主题（系统默认布局的文字色在无 theme 环境下不可控）。 */
-    private class TintAdapter extends ArrayAdapter<String> {
-        TintAdapter(android.content.Context c, String[] items) {
-            super(c, android.R.layout.simple_spinner_item, items);
-            setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+    // ================================================================ 自绘下拉
+    /** 当前展开着的下拉（同一时间只允许一个展开）。 */
+    private Picker openPicker;
+
+    /**
+     * 自绘下拉：左侧当前值 + 右侧 ▶。
+     * 点一下 ▶ 旋转成 ▼，并从控件下方像抽屉一样把选项拉下来；再点一次收起。
+     * 不用系统 Spinner——无主题环境下它的弹窗会错位、盖住后面的字段。
+     */
+    private class Picker extends LinearLayout {
+        private final TextView valueView;
+        private final TextView arrowView;
+        private String[] items = new String[]{"不修改"};
+        private int sel = 0;
+        private boolean enabled = true;
+        private boolean expanded = false;
+        private ScrollView panel;
+        private ValueAnimator anim;
+        private int gen = 0;   // 状态代际：动画回调只在代际一致时生效
+
+        Picker() {
+            super(MainActivity.this);
+            setOrientation(HORIZONTAL);
+            setGravity(Gravity.CENTER_VERTICAL);
+            setBackground(bg(C_BTN_BG, 8, C_BTN_STROKE));
+            setPadding(dp(12), dp(11), dp(10), dp(11));
+            setClickable(true);
+
+            valueView = new TextView(MainActivity.this);
+            valueView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+            valueView.setTextColor(C_TEXT);
+            valueView.setSingleLine(true);
+            valueView.setEllipsize(TextUtils.TruncateAt.END);
+            addView(valueView, new LinearLayout.LayoutParams(0,
+                    ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+            arrowView = new TextView(MainActivity.this);
+            arrowView.setText("\u25B6");
+            arrowView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            arrowView.setTextColor(C_HINT);
+            arrowView.setGravity(Gravity.CENTER);
+            arrowView.setPadding(dp(2), 0, 0, 0);
+            // 给箭头一个正方形盒子：旋转 90° 时不会被自身边界裁掉
+            addView(arrowView, new LinearLayout.LayoutParams(dp(24), dp(24)));
+
+            refresh();
+            setOnClickListener(new View.OnClickListener() {
+                public void onClick(View v) {
+                    if (!enabled) return;
+                    try {
+                        if (expanded) collapse();
+                        else {
+                            if (openPicker != null && openPicker != Picker.this) openPicker.collapse();
+                            openPicker = Picker.this;
+                            expand();
+                        }
+                    } catch (Throwable t) {
+                        // 连点打断动画时不让异常冒泡到主线程
+                        expanded = false;
+                        arrowView.animate().cancel();
+                        arrowView.setRotation(0f);
+                        if (panel != null) panel.setVisibility(View.GONE);
+                    }
+                }
+            });
         }
-        private void paint(TextView t) {
-            if (t != null) t.setTextColor(C_TEXT);
+
+        void setItems(String[] it) {
+            items = it;
+            if (sel >= it.length) sel = 0;
+            refresh();
         }
-        @Override
-        public View getView(int pos, View cv, ViewGroup parent) {
-            View v = super.getView(pos, cv, parent);
-            paint(v instanceof TextView ? (TextView) v : null);
-            return v;
+
+        int getSelectedItemPosition() { return sel; }
+
+        void setSelection(int i) {
+            if (i >= 0 && i < items.length) { sel = i; refresh(); }
         }
-        @Override
-        public View getDropDownView(int pos, View cv, ViewGroup parent) {
-            View v = super.getDropDownView(pos, cv, parent);
-            paint(v instanceof TextView ? (TextView) v : null);
-            return v;
+
+        void setOn(boolean v) {
+            enabled = v;
+            setAlpha(v ? 1f : 0.5f);
+            if (!v) collapse();
+        }
+
+        private void refresh() {
+            if (valueView != null) valueView.setText(items[sel]);
+        }
+
+        /** 把面板插到本控件（若本控件在横向行里，则插到该行）的下方。 */
+        private ViewGroup host() {
+            ViewParent p = getParent();
+            if (!(p instanceof ViewGroup)) return null;
+            ViewGroup parent = (ViewGroup) p;
+            if (parent instanceof LinearLayout
+                    && ((LinearLayout) parent).getOrientation() == LinearLayout.HORIZONTAL
+                    && parent.getParent() instanceof ViewGroup) {
+                return (ViewGroup) parent.getParent();
+            }
+            return parent;
+        }
+
+        private View anchor() {
+            if (getParent() instanceof LinearLayout
+                    && ((LinearLayout) getParent()).getOrientation() == LinearLayout.HORIZONTAL) {
+                return (View) getParent();
+            }
+            return this;
+        }
+
+        private void buildPanel() {
+            if (panel != null) return;
+            panel = new ScrollView(MainActivity.this);
+            panel.setBackground(bg(C_BTN_BG, 10, C_BTN_STROKE));
+            panel.setVisibility(View.GONE);
+            // 展开动画过程中高度小于内容，ScrollView 会画出竖向滚动条（那条白条），关掉
+            panel.setVerticalScrollBarEnabled(false);
+            panel.setHorizontalScrollBarEnabled(false);
+            panel.setOverScrollMode(View.OVER_SCROLL_NEVER);
+            LinearLayout list = column();
+            list.setPadding(dp(4), dp(4), dp(4), dp(4));
+            panel.addView(list, new ScrollView.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+            for (int i = 0; i < items.length; i++) {
+                final int idx = i;
+                final TextView row = new TextView(MainActivity.this);
+                row.setText(items[i]);
+                row.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+                row.setTextColor(i == sel ? C_ACCENT : C_TEXT);
+                if (i == sel) row.setTypeface(null, Typeface.BOLD);
+                row.setPadding(dp(12), dp(12), dp(12), dp(12));
+                GradientDrawable mask = new GradientDrawable();
+                mask.setColor(0xFF000000);
+                mask.setCornerRadius(dp(8));
+                row.setBackground(new RippleDrawable(ColorStateList.valueOf(0x332F6FED), null, mask));
+                row.setClickable(true);
+                row.setOnClickListener(new View.OnClickListener() {
+                    public void onClick(View v) {
+                        sel = idx;
+                        refresh();
+                        collapse();
+                    }
+                });
+                list.addView(row);
+            }
+        }
+
+        private void expand() {
+            gen++;
+            buildPanel();
+            if (panel == null || getParent() == null) return;
+            ViewGroup host = host();
+            View anchor = anchor();
+            if (host == null) return;
+            if (panel.getParent() == null) {
+                int idx = host.indexOfChild(anchor);
+                if (idx < 0) idx = host.getChildCount() - 1;
+                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, 0);
+                lp.topMargin = dp(6);
+                host.addView(panel, Math.max(idx + 1, 0), lp);
+            }
+            panel.setVisibility(View.VISIBLE);
+            ViewGroup.LayoutParams plp = panel.getLayoutParams();
+            if (plp != null) {
+                plp.height = 0;
+                panel.setLayoutParams(plp);
+            }
+            expanded = true;
+            arrowView.animate().rotation(90f).setDuration(180).start();
+
+            final int g = gen;
+            final ViewGroup h = host;
+            h.post(new Runnable() {
+                public void run() {
+                    // 连点后这次排队已经过期，直接丢弃，避免对已收起的面板做测量
+                    if (g != gen || panel == null || panel.getParent() == null) return;
+                    int w = h.getWidth();
+                    if (w <= 0) return;
+                    int natural;
+                    try {
+                        panel.measure(View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.EXACTLY),
+                                View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED));
+                        natural = Math.max(panel.getMeasuredHeight(), dp(20));
+                    } catch (Throwable t) {
+                        return;
+                    }
+                    animateHeight(g, 0, Math.min(natural, dp(280)), 220, null);
+                }
+            });
+        }
+
+        private void collapse() {
+            gen++;
+            expanded = false;
+            arrowView.animate().cancel();
+            arrowView.animate().rotation(0f).setDuration(180).start();
+            if (panel == null) return;
+            final int g = gen;
+            animateHeight(g, Math.max(panel.getHeight(), 0), 0, 180, new Runnable() {
+                public void run() {
+                    if (g != gen || panel == null) return;
+                    panel.setVisibility(View.GONE);
+                }
+            });
+        }
+
+        private void animateHeight(final int g, int from, int to, long dur, final Runnable end) {
+            if (anim != null) anim.cancel();
+            try {
+                anim = ValueAnimator.ofInt(from, to);
+                anim.setDuration(dur);
+                anim.addUpdateListener(new ValueAnimator.AnimatorUpdateListener() {
+                    public void onAnimationUpdate(ValueAnimator a) {
+                        if (g != gen || panel == null) return;
+                        ViewGroup.LayoutParams lp = panel.getLayoutParams();
+                        if (lp == null) return;
+                        lp.height = (int) a.getAnimatedValue();
+                        panel.setLayoutParams(lp);
+                    }
+                });
+                anim.addListener(new android.animation.AnimatorListenerAdapter() {
+                    public void onAnimationEnd(android.animation.Animator a) {
+                        if (g != gen) return;
+                        if (end != null) end.run();
+                    }
+                });
+                anim.start();
+            } catch (Throwable ignored) {
+            }
         }
     }
 
