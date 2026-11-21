@@ -79,6 +79,10 @@ app/src/main/java/com/nmsave/editor/
 
 `tools/` 是开发期用的桌面验证程序（不参与打包），mcsave-editor 的源码包里附带。
 
-## 许可
+## 许可证
 
-本仓库尚未声明开源许可证，默认保留所有权利。需要 MIT / Apache-2.0 等许可请提 issue 说明。
+MIT License，见 [LICENSE](LICENSE)。
+
+## 更新日志
+
+见 [CHANGELOG.md](CHANGELOG.md)。

@@ -10,8 +10,8 @@ android {
         applicationId "com.nmsave.editor"
         minSdk 21
         targetSdk 33
-        versionCode 55
-        versionName "2.7.10"
+        versionCode 56
+        versionName "2.7.11"
         multiDexEnabled false
     }
 

@@ -1446,7 +1446,7 @@ public class MainActivity extends Activity {
         drawer.addView(head);
 
         TextView ver = new TextView(this);
-        ver.setText("2.7.10   支持网易版 / 国际基岩版");
+        ver.setText("2.7.11   支持网易版 / 国际基岩版");
         ver.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
         ver.setTextColor(C_HINT);
         ver.setPadding(dp(18), 0, dp(18), dp(12));
@@ -2158,6 +2158,17 @@ public class MainActivity extends Activity {
         }).start();
     }
 
+    /** 打开外部链接（没有浏览器时给出提示，不静默失败）。 */
+    private void openUrl(String url) {
+        try {
+            Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(i);
+        } catch (Throwable t) {
+            Toast.makeText(this, "打不开浏览器：" + friendlyError(t), Toast.LENGTH_LONG).show();
+        }
+    }
+
     /** 关于本工具：与「看图标」弹窗同一套自绘样式，跟随深浅主题。 */
     private void showAbout() {
         String ver;
@@ -2239,6 +2250,27 @@ public class MainActivity extends Activity {
                 + "改方块不会重算高度图与光照，也不会创建箱子/告示牌这类方块实体。", 12, false, C_HINT);
         note.setLineSpacing(dp(4), 1f);
         bodyCol.addView(note);
+
+        // 开源仓库：点一下直接跳浏览器
+        bodyCol.addView(sectionLabel("开源仓库"));
+        TextView repoLink = new TextView(this);
+        repoLink.setText("github.com/jgfhjkff/mcsave-editor");
+        repoLink.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        repoLink.setTextColor(C_ACCENT);
+        repoLink.setPadding(dp(2), dp(6), dp(2), dp(6));
+        repoLink.setClickable(true);
+        GradientDrawable linkMask = new GradientDrawable();
+        linkMask.setColor(0xFF000000);
+        linkMask.setCornerRadius(dp(6));
+        repoLink.setBackground(new RippleDrawable(
+                ColorStateList.valueOf(0x332F6FED), null, linkMask));
+        repoLink.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { openUrl("https://github.com/jgfhjkff/mcsave-editor"); }
+        });
+        bodyCol.addView(repoLink);
+        TextView relNote = text("版本更新见仓库 Releases 页。", 11, false, C_HINT);
+        relNote.setLineSpacing(dp(3), 1f);
+        bodyCol.addView(relNote);
 
         LinearLayout.LayoutParams bodyLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
