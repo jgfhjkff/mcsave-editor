@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <color name="icon_bg">#2F6FED</color>
+    <!-- 启动窗口 / 窗口底色，与应用页面底色一致，避免冷启动时先闪一大片纯白 -->
     <color name="window_bg">#F7F8FA</color>
 </resources>

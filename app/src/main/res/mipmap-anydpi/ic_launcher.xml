@@ -1,4 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- 非自适应设备用的传统图标：蓝色圆角底 + 同一套矢量前景 -->
 <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
     <item android:drawable="@drawable/ic_launcher_bg" />
     <item android:drawable="@drawable/ic_launcher_foreground" />

@@ -1,5 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!--
+      只用于给「系统启动窗口」提供底色、并统一状态栏/导航栏颜色；界面本身仍全部代码自绘。
+      父主题用平台自带 DeviceDefault.NoActionBar，不引入 support/appcompat，保证单 dex。
+    -->
     <style name="AppTheme" parent="@android:style/Theme.DeviceDefault.NoActionBar">
         <item name="android:windowBackground">@color/window_bg</item>
         <item name="android:colorBackground">@color/window_bg</item>
