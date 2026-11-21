@@ -1,0 +1,32 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.nmsave.editor'
+    compileSdk 33
+
+    defaultConfig {
+        applicationId "com.nmsave.editor"
+        minSdk 21
+        targetSdk 33
+        versionCode 55
+        versionName "2.7.10"
+        multiDexEnabled false
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+
+    lint {
+        abortOnError false
+    }
+}
